@@ -2,7 +2,7 @@ import sys, os, time, random, io, json, pickle
 import clip, torch
 from PIL import Image
 import asyncio
-import redis.asyncio as redis
+import redis
 import numpy as np
 import ssl
 import urllib.request
@@ -44,17 +44,18 @@ if not os.path.isdir(CLIP_STORAGE):
 CLIP_DB = os.environ.get("CLIP_DB", "clip_features.duckdb")
 
 
-async def clip_worker():
-    log.debug("Entering worker loop, using Redis")
+def clip_worker():
+    log.debug("Entering CLIP worker loop, using Redis")
     while True:
-        _, serial_query = await redis_client.blpop(CLIP_Q_NAME)
+        serial_query = redis_client.blpop(CLIP_Q_NAME)
+        _, serial_query = serial_query
         opts = json.loads(serial_query)
         query_ticket = opts.get("query_ticket")
         if not query_ticket:
             log.error("No query ticket found in query")
             continue
 
-        _, contents = await redis_client.blpop(query_ticket)
+        _, contents = redis_client.blpop(f"{query_ticket}_file")
         image_tensor = preprocess(Image.open(io.BytesIO(contents)))
         image_features = model.encode_image(
             torch.unsqueeze(image_tensor.to("cpu"), dim=0)
@@ -62,11 +63,19 @@ async def clip_worker():
         image_embeddings = image_features.cpu().detach().numpy().astype("float32")
         vecbuf = image_embeddings[0]
 
+        try:
+            size = int(opts.get("size", 10))
+        except:
+            log.exception("Invalid size option, defaulting to 10")
+            size = 10
+
         db = duckdb.connect(CLIP_DB)
         matches = db.execute(
-            "select path from clip_features order by array_distance(features, ?::FLOAT[512]) limit 5",
+            f"select path from clip_features order by array_distance(features, ?::FLOAT[512]) limit {10}",
             (vecbuf,),
         ).fetchall()
+
+        matches = [row[0] for row in matches]
 
         store_id = opts.get("store_id")
         if store_id:
@@ -78,7 +87,7 @@ async def clip_worker():
                     f.write(vecbuf)
                 log.debug(f"Stored embedding to {filepath} from {query_ticket}")
 
-        await redis_client.lpush(query_ticket, json.dumps(matches))
+        redis_client.lpush(query_ticket, json.dumps(matches))
         log.debug("Processed query ticket %s", query_ticket)
 
 
